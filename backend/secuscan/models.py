@@ -34,6 +34,20 @@ class SandboxConfig(BaseModel):
     allow_network: bool = Field(default=True, description="Whether subprocess can make network calls")
 
 
+class StderrTruncationMode(str, Enum):
+    """How oversized stderr text is trimmed before persisting execution logs."""
+    HEAD = "head"
+    TAIL = "tail"
+    HEAD_TAIL = "head_tail"
+
+
+class StderrTruncationPolicy(BaseModel):
+    """Configurable policy for capping persisted stderr content."""
+    enabled: bool = True
+    max_chars: int = Field(default=4000, ge=0, description="Maximum stderr characters to persist in execution logs")
+    mode: StderrTruncationMode = StderrTruncationMode.HEAD_TAIL
+
+
 class SandboxViolation(Exception):
     """Raised when sandbox constraints are violated."""
 

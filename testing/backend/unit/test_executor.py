@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from backend.secuscan.config import settings
 from backend.secuscan.database import get_db, init_db
 from backend.secuscan.executor import STREAM_LISTENER_QUEUE_MAXSIZE, TaskExecutor
-from backend.secuscan.models import TaskStatus
+from backend.secuscan.models import TaskStatus, StderrTruncationMode, StderrTruncationPolicy
 from backend.secuscan.plugins import get_plugin_manager, init_plugins
 
 
@@ -247,6 +247,68 @@ def test_resolve_execution_timeout_prefers_max_scan_time(monkeypatch):
     executor = TaskExecutor()
 
     assert executor._resolve_execution_timeout({"max_scan_time": 90, "timeout": 120}) == 90
+
+
+def test_truncate_stderr_for_log_preserves_head_and_tail():
+    executor = TaskExecutor(
+        stderr_truncation_policy=StderrTruncationPolicy(
+            max_chars=12,
+            mode=StderrTruncationMode.HEAD_TAIL,
+        )
+    )
+
+    stderr_text = "ABCDEFGHIJKLMNO"
+
+    truncated = executor._truncate_stderr_for_log(stderr_text)
+
+    assert truncated.startswith("ABCDEF")
+    assert truncated.endswith("JKLMNO")
+    assert "omitted 3 middle characters" in truncated
+
+
+def test_truncate_stderr_for_log_can_be_disabled():
+    executor = TaskExecutor(
+        stderr_truncation_policy=StderrTruncationPolicy(
+            enabled=False,
+            max_chars=5,
+            mode=StderrTruncationMode.TAIL,
+        )
+    )
+
+    stderr_text = "full stderr text"
+
+    assert executor._truncate_stderr_for_log(stderr_text) == stderr_text
+
+
+@pytest.mark.asyncio
+async def test_execute_command_truncates_oversized_stderr_but_keeps_stdout():
+    executor = TaskExecutor(
+        stderr_truncation_policy=StderrTruncationPolicy(
+            max_chars=40,
+            mode=StderrTruncationMode.HEAD_TAIL,
+        )
+    )
+
+    output, exit_code = await executor._execute_command(
+        [
+            "python3",
+            "-c",
+            (
+                "import sys; "
+                "sys.stdout.write('stdout-ok\\n'); "
+                "sys.stderr.write('ERR-START ' + ('x' * 200) + ' ERR-END\\n')"
+            ),
+        ],
+        task_id="stderr-truncation-test",
+        timeout=5,
+    )
+
+    assert exit_code == 0
+    assert "stdout-ok" in output
+    assert "ERR-START" in output
+    assert "ERR-END" in output
+    assert "omitted" in output
+    assert "x" * 80 not in output
 
 
 @pytest.mark.asyncio

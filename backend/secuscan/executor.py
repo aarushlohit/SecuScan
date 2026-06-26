@@ -24,7 +24,13 @@ from .cache import get_cache
 from .config import settings
 from .database import get_db
 from .plugins import get_plugin_manager
-from .models import NotificationDeliveryStatus, TaskStatus, ScanPhase
+from .models import (
+    NotificationDeliveryStatus,
+    TaskStatus,
+    ScanPhase,
+    StderrTruncationPolicy,
+    StderrTruncationMode,
+)
 from .ratelimit import concurrent_limiter
 from .risk_scoring import compute_risk_score, compute_risk_factors
 from .capabilities import CapabilityEnforcer, CapabilityDeniedError, build_enforcer_from_settings
@@ -182,12 +188,55 @@ def _row_value(row: Any, key: str, default: Any = None) -> Any:
 class TaskExecutor:
     """Executes security scanning tasks in isolated environments"""
 
-    def __init__(self):
+    def __init__(self, stderr_truncation_policy: Optional[StderrTruncationPolicy] = None):
         self.running_tasks: Dict[str, asyncio.Task] = {}
         self._process_pids: Dict[str, int] = {}
         # PubSub: Map of task_id to list of active async queues listening for output/status updates
         self._listeners: Dict[str, List[asyncio.Queue]] = {}
         self._capability_enforcer: CapabilityEnforcer = build_enforcer_from_settings()
+        self._stderr_truncation_policy = stderr_truncation_policy or StderrTruncationPolicy()
+
+    def _truncate_stderr_for_log(self, stderr_text: str) -> str:
+        """Return stderr text capped according to the configured persistence policy."""
+        policy = self._stderr_truncation_policy
+        if not stderr_text or not policy.enabled:
+            return stderr_text
+        if len(stderr_text) <= policy.max_chars:
+            return stderr_text
+
+        original_len = len(stderr_text)
+
+        if policy.max_chars == 0:
+            return f"[stderr truncated: omitted {original_len} characters]"
+
+        if policy.mode == StderrTruncationMode.HEAD:
+            kept = stderr_text[:policy.max_chars]
+            omitted = original_len - len(kept)
+            return f"{kept}\n[stderr truncated: omitted {omitted} trailing characters]"
+
+        if policy.mode == StderrTruncationMode.TAIL:
+            kept = stderr_text[-policy.max_chars:]
+            omitted = original_len - len(kept)
+            return f"[stderr truncated: omitted {omitted} leading characters]\n{kept}"
+
+        head_chars = max(1, policy.max_chars // 2)
+        tail_chars = max(0, policy.max_chars - head_chars)
+        head = stderr_text[:head_chars]
+        tail = stderr_text[-tail_chars:] if tail_chars else ""
+        omitted = original_len - (len(head) + len(tail))
+        if tail:
+            return f"{head}\n[stderr truncated: omitted {omitted} middle characters]\n{tail}"
+        return f"{head}\n[stderr truncated: omitted {omitted} trailing characters]"
+
+    def _build_execution_log_output(self, stdout_text: str, stderr_text: str) -> str:
+        """Combine stdout with truncated stderr for persisted raw task output."""
+        truncated_stderr = self._truncate_stderr_for_log(stderr_text)
+        if stdout_text and truncated_stderr:
+            separator = "" if stdout_text.endswith("\n") else "\n"
+            return f"{stdout_text}{separator}{truncated_stderr}"
+        if truncated_stderr:
+            return truncated_stderr
+        return stdout_text
 
     def subscribe(self, task_id: str) -> asyncio.Queue:
         """Subscribe to a task's real-time events."""
@@ -866,29 +915,36 @@ class TaskExecutor:
             process = await asyncio.create_subprocess_exec(
                 *command,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                stderr=subprocess.PIPE,
                 start_new_session=True,
             )
             self._process_pids[task_id] = process.pid
 
-            output_lines = []
+            stdout_lines: List[str] = []
+            stderr_lines: List[str] = []
 
-            async def read_stream():
-                stdout = process.stdout
-                if stdout is None:
+            async def read_stream(stream, buffer: List[str]):
+                if stream is None:
                     return
-                while not stdout.at_eof():
-                    line = await stdout.readline()
+                while not stream.at_eof():
+                    line = await stream.readline()
                     if line:
                         decoded_line = line.decode("utf-8", errors="replace")
-                        output_lines.append(decoded_line)
+                        buffer.append(decoded_line)
                         await self._broadcast(task_id, "output", decoded_line)
 
+            async def read_streams():
+                await asyncio.gather(
+                    read_stream(process.stdout, stdout_lines),
+                    read_stream(process.stderr, stderr_lines),
+                )
+
             try:
-                await asyncio.wait_for(read_stream(), timeout=timeout)
+                await asyncio.wait_for(read_streams(), timeout=timeout)
                 await process.wait()
                 self._process_pids.pop(task_id, None)
-                return "".join(output_lines), process.returncode if process.returncode is not None else -1
+                output = self._build_execution_log_output("".join(stdout_lines), "".join(stderr_lines))
+                return output, process.returncode if process.returncode is not None else -1
 
             except asyncio.TimeoutError:
                 logger.warning(
@@ -901,7 +957,9 @@ class TaskExecutor:
                 except asyncio.TimeoutError:
                     pass
                 self._process_pids.pop(task_id, None)
-                return "".join(output_lines) + "\nTask timed out", -1
+                output = self._build_execution_log_output("".join(stdout_lines), "".join(stderr_lines))
+                suffix = "\nTask timed out" if output else "Task timed out"
+                return f"{output}{suffix}", -1
 
             except asyncio.CancelledError:
                 logger.warning(
